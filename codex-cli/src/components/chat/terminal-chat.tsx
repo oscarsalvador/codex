@@ -13,7 +13,12 @@ import { useTerminalSize } from "../../hooks/use-terminal-size.js";
 import { AgentLoop } from "../../utils/agent/agent-loop.js";
 import { ReviewDecision } from "../../utils/agent/review.js";
 import { generateCompactSummary } from "../../utils/compact-summary.js";
-import { getBaseUrl, getApiKey, saveConfig, PROXY_URL } from "../../utils/config.js";
+import {
+  getBaseUrl,
+  getApiKey,
+  saveConfig,
+  PROXY_URL,
+} from "../../utils/config.js";
 import { extractAppliedPatches as _extractAppliedPatches } from "../../utils/extract-applied-patches.js";
 import { getGitDiff } from "../../utils/get-diff.js";
 import { createInputItem } from "../../utils/input-utils.js";
@@ -57,7 +62,7 @@ type Props = {
 };
 
 const colorsByPolicy: Record<ApprovalPolicy, ColorName | undefined> = {
-  "suggest": undefined,
+  suggest: undefined,
   "auto-edit": "greenBright",
   "full-auto": "green",
 };
