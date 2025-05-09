@@ -11,7 +11,7 @@ export const openAiModelInfo = {
     label: "o1 Pro (2025-03-19)",
     maxContextLength: 200000,
   },
-  o3: {
+  "o3": {
     label: "o3",
     maxContextLength: 200000,
   },
@@ -135,7 +135,7 @@ export const openAiModelInfo = {
     label: "GPT-4 (0613)",
     maxContextLength: 8192,
   },
-  o1: {
+  "o1": {
     label: "o1",
     maxContextLength: 128000,
   },
