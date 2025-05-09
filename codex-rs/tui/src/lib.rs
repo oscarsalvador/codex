@@ -2,7 +2,6 @@
 // The standalone `codex-tui` binary prints a short help message before the
 // alternate‑screen mode starts; that file opts‑out locally via `allow`.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
-
 use app::App;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -34,8 +33,6 @@ mod user_approval_widget;
 pub use cli::Cli;
 
 pub fn run_main(cli: Cli) -> std::io::Result<()> {
-    assert_env_var_set();
-
     let (sandbox_policy, approval_policy) = if cli.full_auto {
         (
             Some(SandboxPolicy::new_full_auto_policy()),
@@ -58,6 +55,7 @@ pub fn run_main(cli: Cli) -> std::io::Result<()> {
                 None
             },
             cwd: cli.cwd.clone().map(|p| p.canonicalize().unwrap_or(p)),
+            provider: None,
         };
         #[allow(clippy::print_stderr)]
         match Config::load_with_overrides(overrides) {
@@ -170,20 +168,6 @@ fn run_ratatui_app(
 
     restore();
     app_result
-}
-
-#[expect(
-    clippy::print_stderr,
-    reason = "TUI should not have been displayed yet, so we can write to stderr."
-)]
-fn assert_env_var_set() {
-    if std::env::var("OPENAI_API_KEY").is_err() {
-        eprintln!("Welcome to codex! It looks like you're missing: `OPENAI_API_KEY`");
-        eprintln!(
-            "Create an API key (https://platform.openai.com) and export as an environment variable"
-        );
-        std::process::exit(1);
-    }
 }
 
 #[expect(

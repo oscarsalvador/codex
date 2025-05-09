@@ -11,6 +11,8 @@ use mcp_types::CallToolResult;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::model_provider_info::ModelProviderInfo;
+
 /// Submission Queue Entry - requests from user
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Submission {
@@ -23,10 +25,14 @@ pub struct Submission {
 /// Submission operation
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 pub enum Op {
     /// Configure the model session.
     ConfigureSession {
+        /// Provider identifier ("openai", "openrouter", ...).
+        provider: ModelProviderInfo,
+
         /// If not specified, server will use its default model.
         model: String,
         /// Model instructions

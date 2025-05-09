@@ -1,10 +1,13 @@
+// Poisoned mutex should fail the program
+#![allow(clippy::unwrap_used)]
+
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -16,7 +19,6 @@ use codex_apply_patch::ApplyPatchFileChange;
 use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_apply_patch::maybe_parse_apply_patch_verified;
 use codex_apply_patch::print_summary;
-use fs_err as fs;
 use futures::prelude::*;
 use serde::Serialize;
 use serde_json;
@@ -29,11 +31,12 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use crate::WireApi;
 use crate::client::ModelClient;
-use crate::client::Prompt;
-use crate::client::ResponseEvent;
+use crate::client_common::Prompt;
+use crate::client_common::ResponseEvent;
 use crate::config::Config;
-use crate::config::ConfigOverrides;
+use crate::conversation_history::ConversationHistory;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::exec::ExecParams;
@@ -64,32 +67,63 @@ use crate::safety::assess_command_safety;
 use crate::safety::assess_patch_safety;
 use crate::user_notification::UserNotification;
 use crate::util::backoff;
-use crate::zdr_transcript::ZdrTranscript;
 
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
-#[derive(Clone)]
 pub struct Codex {
+    next_id: AtomicU64,
     tx_sub: Sender<Submission>,
     rx_event: Receiver<Event>,
-    recorder: Recorder,
 }
 
 impl Codex {
-    pub fn spawn(ctrl_c: Arc<Notify>) -> CodexResult<Self> {
-        CodexBuilder::default().spawn(ctrl_c)
+    /// Spawn a new [`Codex`] and initialize the session. Returns the instance
+    /// of `Codex` and the ID of the `SessionInitialized` event that was
+    /// submitted to start the session.
+    pub async fn spawn(config: Config, ctrl_c: Arc<Notify>) -> CodexResult<(Codex, String)> {
+        let (tx_sub, rx_sub) = async_channel::bounded(64);
+        let (tx_event, rx_event) = async_channel::bounded(64);
+        let configure_session = Op::ConfigureSession {
+            provider: config.model_provider.clone(),
+            model: config.model.clone(),
+            instructions: config.instructions.clone(),
+            approval_policy: config.approval_policy,
+            sandbox_policy: config.sandbox_policy.clone(),
+            disable_response_storage: config.disable_response_storage,
+            notify: config.notify.clone(),
+            cwd: config.cwd.clone(),
+        };
+
+        tokio::spawn(submission_loop(config, rx_sub, tx_event, ctrl_c));
+        let codex = Codex {
+            next_id: AtomicU64::new(0),
+            tx_sub,
+            rx_event,
+        };
+        let init_id = codex.submit(configure_session).await?;
+
+        Ok((codex, init_id))
     }
 
-    pub fn builder() -> CodexBuilder {
-        CodexBuilder::default()
+    /// Submit the `op` wrapped in a `Submission` with a unique ID.
+    pub async fn submit(&self, op: Op) -> CodexResult<String> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .to_string();
+        let sub = Submission { id: id.clone(), op };
+        self.submit_with_id(sub).await?;
+        Ok(id)
     }
 
-    pub async fn submit(&self, sub: Submission) -> CodexResult<()> {
-        self.recorder.record_submission(&sub);
+    /// Use sparingly: prefer `submit()` so Codex is responsible for generating
+    /// unique IDs for each submission.
+    pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
         self.tx_sub
             .send(sub)
             .await
-            .map_err(|_| CodexErr::InternalAgentDied)
+            .map_err(|_| CodexErr::InternalAgentDied)?;
+        Ok(())
     }
 
     pub async fn next_event(&self) -> CodexResult<Event> {
@@ -98,97 +132,7 @@ impl Codex {
             .recv()
             .await
             .map_err(|_| CodexErr::InternalAgentDied)?;
-        self.recorder.record_event(&event);
         Ok(event)
-    }
-}
-
-#[derive(Default)]
-pub struct CodexBuilder {
-    record_submissions: Option<PathBuf>,
-    record_events: Option<PathBuf>,
-}
-
-impl CodexBuilder {
-    pub fn spawn(self, ctrl_c: Arc<Notify>) -> CodexResult<Codex> {
-        let (tx_sub, rx_sub) = async_channel::bounded(64);
-        let (tx_event, rx_event) = async_channel::bounded(64);
-        let recorder = Recorder::new(&self)?;
-        tokio::spawn(submission_loop(rx_sub, tx_event, ctrl_c));
-        Ok(Codex {
-            tx_sub,
-            rx_event,
-            recorder,
-        })
-    }
-
-    pub fn record_submissions(mut self, path: impl AsRef<Path>) -> Self {
-        debug!("Recording submissions to {:?}", path.as_ref());
-        self.record_submissions = Some(path.as_ref().to_path_buf());
-        self
-    }
-
-    pub fn record_events(mut self, path: impl AsRef<Path>) -> Self {
-        debug!("Recording events to {:?}", path.as_ref());
-        self.record_events = Some(path.as_ref().to_path_buf());
-        self
-    }
-}
-
-#[derive(Clone)]
-struct Recorder {
-    submissions: Option<Arc<Mutex<fs::File>>>,
-    events: Option<Arc<Mutex<fs::File>>>,
-}
-
-impl Recorder {
-    fn new(builder: &CodexBuilder) -> CodexResult<Self> {
-        let submissions = match &builder.record_submissions {
-            Some(path) => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let f = fs::File::create(path)?;
-                Some(Arc::new(Mutex::new(f)))
-            }
-            None => None,
-        };
-        let events = match &builder.record_events {
-            Some(path) => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let f = fs::File::create(path)?;
-                Some(Arc::new(Mutex::new(f)))
-            }
-            None => None,
-        };
-        Ok(Self {
-            submissions,
-            events,
-        })
-    }
-
-    pub fn record_submission(&self, sub: &Submission) {
-        let Some(f) = &self.submissions else {
-            return;
-        };
-        let mut f = f.lock().unwrap();
-        let json = serde_json::to_string(sub).expect("failed to serialize submission json");
-        if let Err(e) = writeln!(f, "{json}") {
-            warn!("failed to record submission: {e:#}");
-        }
-    }
-
-    pub fn record_event(&self, event: &Event) {
-        let Some(f) = &self.events else {
-            return;
-        };
-        let mut f = f.lock().unwrap();
-        let json = serde_json::to_string(event).expect("failed to serialize event json");
-        if let Err(e) = writeln!(f, "{json}") {
-            warn!("failed to record event: {e:#}");
-        }
     }
 }
 
@@ -238,7 +182,7 @@ struct State {
     previous_response_id: Option<String>,
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
     pending_input: Vec<ResponseInputItem>,
-    zdr_transcript: Option<ZdrTranscript>,
+    zdr_transcript: Option<ConversationHistory>,
 }
 
 impl Session {
@@ -473,11 +417,15 @@ impl Drop for Session {
 }
 
 impl State {
-    pub fn partial_clone(&self) -> Self {
+    pub fn partial_clone(&self, retain_zdr_transcript: bool) -> Self {
         Self {
             approved_commands: self.approved_commands.clone(),
             previous_response_id: self.previous_response_id.clone(),
-            zdr_transcript: self.zdr_transcript.clone(),
+            zdr_transcript: if retain_zdr_transcript {
+                self.zdr_transcript.clone()
+            } else {
+                None
+            },
             ..Default::default()
         }
     }
@@ -519,6 +467,7 @@ impl AgentTask {
 }
 
 async fn submission_loop(
+    config: Config,
     rx_sub: Receiver<Submission>,
     tx_event: Sender<Event>,
     ctrl_c: Arc<Notify>,
@@ -564,6 +513,7 @@ async fn submission_loop(
                 sess.abort();
             }
             Op::ConfigureSession {
+                provider,
                 model,
                 instructions,
                 approval_policy,
@@ -572,7 +522,7 @@ async fn submission_loop(
                 notify,
                 cwd,
             } => {
-                info!(model, "Configuring session");
+                info!("Configuring session: model={model}; provider={provider:?}");
                 if !cwd.is_absolute() {
                     let message = format!("cwd is not absolute: {cwd:?}");
                     error!(message);
@@ -586,17 +536,22 @@ async fn submission_loop(
                     return;
                 }
 
-                let client = ModelClient::new(model.clone());
+                let client = ModelClient::new(model.clone(), provider.clone());
 
                 // abort any current running session and clone its state
+                let retain_zdr_transcript =
+                    record_conversation_history(disable_response_storage, provider.wire_api);
                 let state = match sess.take() {
                     Some(sess) => {
                         sess.abort();
-                        sess.state.lock().unwrap().partial_clone()
+                        sess.state
+                            .lock()
+                            .unwrap()
+                            .partial_clone(retain_zdr_transcript)
                     }
                     None => State {
-                        zdr_transcript: if disable_response_storage {
-                            Some(ZdrTranscript::new())
+                        zdr_transcript: if retain_zdr_transcript {
+                            Some(ConversationHistory::new())
                         } else {
                             None
                         },
@@ -606,24 +561,34 @@ async fn submission_loop(
 
                 let writable_roots = Mutex::new(get_writable_roots(&cwd));
 
-                // Load config to initialize the MCP connection manager.
-                let config = match Config::load_with_overrides(ConfigOverrides::default()) {
-                    Ok(cfg) => cfg,
-                    Err(e) => {
-                        error!("Failed to load config for MCP servers: {e:#}");
-                        // Fall back to empty server map so the session can still proceed.
-                        Config::load_default_config_for_test()
-                    }
-                };
-
-                let mcp_connection_manager =
+                // Error messages to dispatch after SessionConfigured is sent.
+                let mut mcp_connection_errors = Vec::<Event>::new();
+                let (mcp_connection_manager, failed_clients) =
                     match McpConnectionManager::new(config.mcp_servers.clone()).await {
-                        Ok(mgr) => mgr,
+                        Ok((mgr, failures)) => (mgr, failures),
                         Err(e) => {
-                            error!("Failed to create MCP connection manager: {e:#}");
-                            McpConnectionManager::default()
+                            let message = format!("Failed to create MCP connection manager: {e:#}");
+                            error!("{message}");
+                            mcp_connection_errors.push(Event {
+                                id: sub.id.clone(),
+                                msg: EventMsg::Error { message },
+                            });
+                            (McpConnectionManager::default(), Default::default())
                         }
                     };
+
+                // Surface individual client start-up failures to the user.
+                if !failed_clients.is_empty() {
+                    for (server_name, err) in failed_clients {
+                        let message =
+                            format!("MCP client for `{server_name}` failed to start: {err:#}");
+                        error!("{message}");
+                        mcp_connection_errors.push(Event {
+                            id: sub.id.clone(),
+                            msg: EventMsg::Error { message },
+                        });
+                    }
+                }
 
                 // Attempt to create a RolloutRecorder *before* moving the
                 // `instructions` value into the Session struct.
@@ -651,12 +616,15 @@ async fn submission_loop(
                 }));
 
                 // ack
-                let event = Event {
-                    id: sub.id,
+                let events = std::iter::once(Event {
+                    id: sub.id.clone(),
                     msg: EventMsg::SessionConfigured { model },
-                };
-                if tx_event.send(event).await.is_err() {
-                    return;
+                })
+                .chain(mcp_connection_errors.into_iter());
+                for event in events {
+                    if let Err(e) = tx_event.send(event).await {
+                        error!("failed to send event: {e:?}");
+                    }
                 }
             }
             Op::UserInput { items } => {
@@ -735,20 +703,34 @@ async fn run_task(sess: Arc<Session>, sub_id: String, input: Vec<InputItem>) {
         let pending_input = sess.get_pending_input().into_iter().map(ResponseItem::from);
         net_new_turn_input.extend(pending_input);
 
+        // Persist only the net-new items of this turn to the rollout.
+        sess.record_rollout_items(&net_new_turn_input).await;
+
+        // Construct the input that we will send to the model. When using the
+        // Chat completions API (or ZDR clients), the model needs the full
+        // conversation history on each turn. The rollout file, however, should
+        // only record the new items that originated in this turn so that it
+        // represents an append-only log without duplicates.
         let turn_input: Vec<ResponseItem> =
             if let Some(transcript) = sess.state.lock().unwrap().zdr_transcript.as_mut() {
-                // If we are using ZDR, we need to send the transcript with every turn.
-                let mut full_transcript = transcript.contents();
-                full_transcript.extend(net_new_turn_input.clone());
+                // If we are using Chat/ZDR, we need to send the transcript with every turn.
+
+                // 1. Build up the conversation history for the next turn.
+                let full_transcript = [transcript.contents(), net_new_turn_input.clone()].concat();
+
+                // 2. Update the in-memory transcript so that future turns
+                // include these items as part of the history.
                 transcript.record_items(net_new_turn_input);
+
+                // Note that `transcript.record_items()` does some filtering
+                // such that `full_transcript` may include items that were
+                // excluded from `transcript`.
                 full_transcript
             } else {
+                // Responses API path – we can just send the new items and
+                // record the same.
                 net_new_turn_input
             };
-
-        // Persist the input part of the turn to the rollout (user messages /
-        // function_call_output from previous step).
-        sess.record_rollout_items(&turn_input).await;
 
         let turn_input_messages: Vec<String> = turn_input
             .iter()
@@ -859,6 +841,7 @@ async fn run_turn(
         match try_run_turn(sess, &sub_id, &prompt).await {
             Ok(output) => return Ok(output),
             Err(CodexErr::Interrupted) => return Err(CodexErr::Interrupted),
+            Err(CodexErr::EnvVar(var)) => return Err(CodexErr::EnvVar(var)),
             Err(e) => {
                 if retries < *OPENAI_STREAM_MAX_RETRIES {
                     retries += 1;
@@ -1676,4 +1659,16 @@ fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<St
             None
         }
     })
+}
+
+/// See [`ConversationHistory`] for details.
+fn record_conversation_history(disable_response_storage: bool, wire_api: WireApi) -> bool {
+    if disable_response_storage {
+        return true;
+    }
+
+    match wire_api {
+        WireApi::Responses => false,
+        WireApi::Chat => true,
+    }
 }
